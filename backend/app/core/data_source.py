@@ -8,8 +8,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # 禁用系统代理（akshare 直连东财 API，走代理反而易断）
-os.environ.setdefault("NO_PROXY", "*")
-os.environ.setdefault("no_proxy", "*")
+os.environ["NO_PROXY"] = "*"
+os.environ["no_proxy"] = "*"
+os.environ["HTTP_PROXY"] = ""
+os.environ["HTTPS_PROXY"] = ""
+os.environ["http_proxy"] = ""
+os.environ["https_proxy"] = ""
+
+# 彻底禁用 requests 从 Windows 注册表读取的系统代理
+import urllib.request
+urllib.request.getproxies = lambda: {}
 
 import akshare as ak
 import pandas as pd
@@ -115,6 +123,15 @@ def search_stocks(keyword: str, limit: int = 20) -> list[dict]:
 # 日 K 线
 # ---------------------------------------------------------------------------
 
+def _to_tx_symbol(code: str) -> str:
+    """6位股票代码 → 腾讯格式：600519 → sh600519，000001 → sz000001。"""
+    code = str(code).zfill(6)
+    # 6/9 开头 = 上海主板/科创板，5 开头 = 上海 ETF
+    if code.startswith(("5", "6", "9")):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
 def get_daily_kline(
     symbol: str,
     days: int = 500,
@@ -137,17 +154,26 @@ def get_daily_kline(
         if df is not None and not df.empty:
             return _normalize_kline(df, days)
 
-    raw = _retry(lambda: ak.stock_zh_a_hist(
-        symbol=symbol, period="daily", start_date=start,
-        end_date=end, adjust=adjust,
-    ))
+    # 优先腾讯数据源（不经过东财 push2 服务器，兼容性更好）
+    try:
+        raw = _retry(lambda: ak.stock_zh_a_hist_tx(
+            symbol=_to_tx_symbol(symbol), start_date=start, end_date=end,
+        ))
+    except Exception:
+        # 腾讯失败则回退东财
+        raw = _retry(lambda: ak.stock_zh_a_hist(
+            symbol=symbol, period="daily", start_date=start,
+            end_date=end, adjust=adjust,
+        ))
+        if raw is not None and not raw.empty:
+            raw = raw.rename(columns={
+                "日期": "date", "开盘": "open", "收盘": "close",
+                "最高": "high", "最低": "low", "成交量": "volume", "成交额": "amount",
+            })
+
     if raw is None or raw.empty:
         return pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume", "amount"])
 
-    raw = raw.rename(columns={
-        "日期": "date", "开盘": "open", "收盘": "close",
-        "最高": "high", "最低": "low", "成交量": "volume", "成交额": "amount",
-    })
     raw.to_csv(path, index=False, encoding="utf-8-sig")
     return _normalize_kline(raw, days)
 
